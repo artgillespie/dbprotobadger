@@ -15,16 +15,26 @@ const TestPath = "/tmp/badger"
 
 type Blob []byte
 
+func (b Blob) Sha() string {
+	return fmt.Sprintf("%x", sha1.Sum(b))
+}
+
+// Ref returns the blob's object key
+func (b Blob) Ref() string {
+	return fmt.Sprintf("/object/%s", b.Sha())
+}
+
+// Store will set the blob at key `/object/<b.Sha()>`
+func (b Blob) Store(txn *badger.Txn) error {
+	return txn.Set([]byte(b.Ref()), b)
+}
+
 type Commit struct {
 	Timestamp time.Time `json:"timestamp"`
 	Author    string    `json:"author"` // could be a user ref
 	Message   string    `json:"message"`
 	Parent    string    `json:"parent"` // sha of the parent
 	SHA       string    `json:"sha"`    // sha of the new version
-}
-
-func (b Blob) Sha() string {
-	return fmt.Sprintf("%x", sha1.Sum(b))
 }
 
 func cleanupDBFiles() error {
@@ -345,4 +355,155 @@ func TestTimeSorting(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+/*
+	"/ref/nd001/production" -> Commit SHA -> Root Node SHA
+	"/tag/nd001/v1.1" -> Commit SHA -> Root Node SHA
+	"/object/sha" -> data
+*/
+type Ref string
+
+type Node struct {
+	Key      string `json:"key"`
+	Title    string `json:"title"`
+	Children []Ref  `json:"children"`
+}
+
+func TestVersioningTrees(t *testing.T) {
+	db, err := dbOpen()
+	if err != nil {
+		t.Fatalf("Error loading database: %v", err)
+	}
+	defer db.Close()
+	defer cleanupDBFiles()
+	nd := Node{"nd001", "Front-End Nanodegree", []Ref{}}
+	ndBytes, err := makeJSONBlob(nd)
+	if err != nil {
+		t.Fatalf("json.Marshal failed with error: %v", err)
+	}
+	err = db.Update(func(txn *badger.Txn) error {
+		// get the node's sha
+		ndSha := ndBytes.Sha()
+		// put the node in the object namespace
+		err := txn.Set([]byte(fmt.Sprintf("/object/%s", ndSha)), ndBytes)
+		if err != nil {
+			return err
+		}
+		commit := Commit{time.Now(), "art@udacity.com", "Initial Save of ND-001", "", ndSha}
+		commitBytes, err := makeJSONBlob(commit)
+		if err != nil {
+			t.Fatalf("makeJSONBlob(commit) failed with error: %v", err)
+		}
+		commitSha := commitBytes.Sha()
+		err = txn.Set([]byte(fmt.Sprintf("/object/%s", commitSha)), commitBytes)
+		if err != nil {
+			return err
+		}
+		// write out a ref to the commit named 'master'
+		err = txn.Set([]byte("/ref/nd001/master"), []byte(commitSha))
+		return err
+	})
+	if err != nil {
+		t.Fatalf("update txn failed with error: %v", err)
+	}
+	// hoist these so we can use them later
+	var retrievedCommit Commit
+	var retrievedNode Node
+	var v1CommitBytes Blob
+	// now that we have a simple, empty tree, let's look at it...
+	err = db.View(func(txn *badger.Txn) error {
+		// get the master 'branch'
+		item, err := txn.Get([]byte("/ref/nd001/master"))
+		if err != nil {
+			return err
+		}
+		commitSha, err := item.ValueCopy(nil)
+		if err != nil {
+			return err
+		}
+		t.Logf("Got nd001/master commit sha: %s\n", commitSha)
+		// now that we have the commit's sha, fetch the commit
+		item, err = txn.Get([]byte(fmt.Sprintf("/object/%s", commitSha)))
+		if err != nil {
+			return err
+		}
+		v1CommitBytes, err = item.Value()
+		if err != nil {
+			return err
+		}
+		err = json.Unmarshal(v1CommitBytes, &retrievedCommit)
+		if err != nil {
+			return err
+		}
+		t.Logf("Got nd001/master commit (%s): %+v", commitSha, retrievedCommit)
+		// now that we have the commit object, fetch the node it refers to
+		item, err = txn.Get([]byte(fmt.Sprintf("/object/%s", retrievedCommit.SHA)))
+		if err != nil {
+			return err
+		}
+		nodeBytes, err := item.Value()
+		if err != nil {
+			return err
+		}
+		err = json.Unmarshal(nodeBytes, &retrievedNode)
+		if err != nil {
+			return err
+		}
+		t.Logf("Got nd001/master (%s) root node: %+v", commitSha, retrievedNode)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("view txn failed with error: %v", err)
+	}
+	db.Update(func(txn *badger.Txn) error {
+		course := Node{"ud-008", "Welcome To Machine Learning", []Ref{}}
+		courseBytes, err := makeJSONBlob(course)
+		if err != nil {
+			return err
+		}
+		courseRef := Ref(fmt.Sprintf("/object/%s", courseBytes.Sha()))
+		err = txn.Set([]byte(courseRef), courseBytes)
+		if err != nil {
+			return err
+		}
+		part := Node{"part-01", "Welcome To Machine Learning", []Ref{courseRef}}
+		partBytes, err := makeJSONBlob(part)
+		if err != nil {
+			return err
+		}
+		partRef := Ref(fmt.Sprintf("/object/%s", partBytes.Sha()))
+		err = txn.Set([]byte(partRef), partBytes)
+		if err != nil {
+			return err
+		}
+		// add the part to the root node (retrieved in last step)
+		retrievedNode.Children = append(retrievedNode.Children, partRef)
+		// store the new version of the root node
+		rootBytes, err := makeJSONBlob(retrievedNode)
+		if err != err {
+			return err
+		}
+		err = txn.Set([]byte(fmt.Sprintf("/object/%s", rootBytes.Sha())), rootBytes)
+		if err != err {
+			return err
+		}
+		// store the v2 commit object (its parent is the v1 commit object)
+		v2Commit := Commit{time.Now(), "art@udacity.com", "added part and course", v1CommitBytes.Sha(), rootBytes.Sha()}
+		v2CommitBytes, err := makeJSONBlob(v2Commit)
+		err = txn.Set([]byte(fmt.Sprintf("/object/%s", v2CommitBytes.Sha())), v2CommitBytes)
+		if err != nil {
+			return err
+		}
+		err = txn.Set([]byte("/ref/nd001/master"), []byte(v2CommitBytes.Sha()))
+		return err
+	})
+	// now we've stored v2 and updated the `master` reference to it. next step:
+	// next step: fetch the `master` ref and traverse it all the way down to get the
+	// full node -> part -> course tree.
+	//
+	// then, try getting a log by following the commit's parent
+	if err != nil {
+		t.Fatalf("update txn failed with error: %v", err)
+	}
 }
